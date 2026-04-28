@@ -10,9 +10,10 @@ from message import (
     send_message, recv_message, make_register, make_client_response,
     make_request_vote, make_request_vote_response,
     make_append_entries, make_append_entries_response,
+    make_install_snapshot, make_install_snapshot_response,
     MSG_REGISTER_ACK, MSG_APPEND_ENTRIES, MSG_APPEND_ENTRIES_RESPONSE,
     MSG_REQUEST_VOTE, MSG_REQUEST_VOTE_RESPONSE,
-    MSG_CLIENT_REQUEST,
+    MSG_CLIENT_REQUEST, MSG_INSTALL_SNAPSHOT, MSG_INSTALL_SNAPSHOT_RESPONSE,
 )
 from config import (
     NETWORK_HOST, NETWORK_PORT, CLUSTER_SIZE, NODE_IDS,
@@ -60,6 +61,8 @@ class RaftNode:
         self.current_term = 0
         self.voted_for = None
         self.log = []
+        self.last_included_index = 0
+        self.last_included_term = 0
 
         # === Raft Volatile State ===
         self.commit_index = 0
@@ -145,6 +148,10 @@ class RaftNode:
             self.handle_request_vote(msg)
         elif msg_type == MSG_REQUEST_VOTE_RESPONSE:
             self.handle_request_vote_response(msg)
+        elif msg_type == MSG_INSTALL_SNAPSHOT:
+            self.handle_install_snapshot(msg)
+        elif msg_type == MSG_INSTALL_SNAPSHOT_RESPONSE:
+            self.handle_install_snapshot_response(msg)
         elif msg_type == MSG_CLIENT_REQUEST:
             self.handle_client_request(msg)
         # Ignore unknown message types silently
@@ -318,11 +325,28 @@ class RaftNode:
         As per Raft Section 5.3:
         - Include log entries starting from next_index[follower]
         - If log is empty or heartbeat, entries will be empty
+        - (Log Compaction): If next_index <= last_included_index, send InstallSnapshot
         """
         for follower_id in NODE_IDS:
             if follower_id == self.node_id:
                 continue
                 
+            if self.next_index[follower_id] <= self.last_included_index:
+                # Follower needs a snapshot
+                msg = make_install_snapshot(
+                    self.node_id,
+                    follower_id,
+                    self.current_term,
+                    self.last_included_index,
+                    self.last_included_term,
+                    {
+                        "kv_store": self.kv_store,
+                        "client_responses": self.client_responses
+                    }
+                )
+                self._send(msg)
+                continue
+
             prev_log_index = self.next_index[follower_id] - 1
             prev_log_term = self._get_log_term(prev_log_index)
             entries = self._get_log_slice(self.next_index[follower_id])
@@ -589,6 +613,80 @@ class RaftNode:
                 # The response is sent in apply_committed() once the
                 # entry is replicated and committed.
 
+    def handle_install_snapshot(self, msg):
+        """
+        Handle an InstallSnapshot RPC from the leader.
+        """
+        with self.lock:
+            term = msg.get("term")
+            leader_id = msg.get("src")
+            last_included_index = msg.get("last_included_index")
+            last_included_term = msg.get("last_included_term")
+            data = msg.get("data")
+
+            if term < self.current_term:
+                success = False
+            else:
+                self.last_heartbeat_time = time.time()
+                self.leader_id = leader_id
+                if term > self.current_term:
+                    self._step_down(term)
+                    self.save_state()
+
+                # Rule 6: If existing log entry has same index and term as 
+                # snapshot's last included entry, retain log entries following it
+                # (Simplified: we just clear if it's ahead)
+                if last_included_index > self.last_included_index:
+                    self.load_snapshot(data)
+                    self.last_included_index = last_included_index
+                    self.last_included_term = last_included_term
+                    
+                    # Discard log entries up to last_included_index
+                    self.log = [e for e in self.log if e["index"] > last_included_index]
+                    
+                    if last_included_index > self.commit_index:
+                        self.commit_index = last_included_index
+                    if last_included_index > self.last_applied:
+                        self.last_applied = last_included_index
+                    
+                    self.save_state()
+                    print(f"[{self.node_id}] Installed snapshot up to index {last_included_index}")
+                
+                success = True
+
+            response = make_install_snapshot_response(
+                self.node_id,
+                leader_id,
+                self.current_term,
+                last_included_index,
+                success
+            )
+            self._send(response)
+
+    def handle_install_snapshot_response(self, msg):
+        """
+        Handle an InstallSnapshot response from a follower.
+        """
+        with self.lock:
+            term = msg.get("term")
+            success = msg.get("success")
+            follower_id = msg.get("src")
+            last_included_index = msg.get("last_included_index")
+
+            if term > self.current_term:
+                self._step_down(term)
+                self.save_state()
+                return
+
+            if self.role == LEADER and term == self.current_term:
+                if success:
+                    # Update indices based on the snapshot
+                    self.match_index[follower_id] = max(self.match_index.get(follower_id, 0), last_included_index)
+                    self.next_index[follower_id] = self.match_index[follower_id] + 1
+                    
+                    # Try to advance commit_index (though snapshot itself doesn't advance it, 
+                    # it might have been advanced by other means)
+
     # STATE MACHINE APPLICATION
 
     def apply_committed(self):
@@ -598,6 +696,7 @@ class RaftNode:
         Follows Raft Section 5.3:
         - Apply each entry from last_applied + 1 up to commit_index
         - If we are leader, send response to the client
+        - (Log Compaction): Trigger snapshot if log exceeds threshold
         """
         while self.last_applied < self.commit_index:
             self.last_applied += 1
@@ -631,38 +730,117 @@ class RaftNode:
                     self.client_responses[request_id] = response
                     self._send(response)
 
+        # Check if we should take a snapshot
+        if len(self.log) >= SNAPSHOT_THRESHOLD:
+            self.take_snapshot()
+
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
 
     def take_snapshot(self):
-        # TODO (Part 3): Implement snapshotting
-        pass
+        """
+        Create a snapshot of the current state machine and discard old log entries.
+        """
+        # We can only snapshot what has been applied to the state machine
+        if self.last_applied <= self.last_included_index:
+            return
+
+        # Find the entry at last_applied to get its term
+        last_applied_entry = None
+        for entry in self.log:
+            if entry["index"] == self.last_applied:
+                last_applied_entry = entry
+                break
+        
+        if not last_applied_entry:
+            return
+
+        self.last_included_index = last_applied_entry["index"]
+        self.last_included_term = last_applied_entry["term"]
+
+        # Discard log entries up to last_included_index
+        self.log = [e for e in self.log if e["index"] > self.last_included_index]
+
+        self.save_state()
+        print(f"[{self.node_id}] Took snapshot up to index {self.last_included_index}, log size now {len(self.log)}")
 
     def load_snapshot(self, snapshot_data):
-        # TODO (Part 3): Implement snapshot loading
-        pass
+        """
+        Load the state machine state from a snapshot.
+        """
+        if snapshot_data:
+            self.kv_store = snapshot_data.get("kv_store", {})
+            self.client_responses = snapshot_data.get("client_responses", {})
 
     # STATE PERSISTENCE (Part 3)
 
     def save_state(self):
-        # TODO (Part 3): Implement state persistence
-        pass
+        """
+        Persist Raft state to disk.
+        """
+        if not os.path.exists(DATA_DIR):
+            os.makedirs(DATA_DIR)
+
+        state = {
+            "current_term": self.current_term,
+            "voted_for": self.voted_for,
+            "log": self.log,
+            "last_included_index": self.last_included_index,
+            "last_included_term": self.last_included_term,
+            "kv_store": self.kv_store,
+            "client_responses": self.client_responses
+        }
+
+        path = os.path.join(DATA_DIR, f"node_{self.node_id}.json")
+        try:
+            with open(path + ".tmp", "w") as f:
+                json.dump(state, f)
+            os.replace(path + ".tmp", path)
+        except Exception as e:
+            print(f"[{self.node_id}] Error saving state: {e}")
 
     def load_state(self):
-        # TODO (Part 3): Implement state loading
-        pass
+        """
+        Load persisted Raft state from disk.
+        """
+        path = os.path.join(DATA_DIR, f"node_{self.node_id}.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    state = json.load(f)
+                    self.current_term = state.get("current_term", 0)
+                    self.voted_for = state.get("voted_for")
+                    self.log = state.get("log", [])
+                    self.last_included_index = state.get("last_included_index", 0)
+                    self.last_included_term = state.get("last_included_term", 0)
+                    self.kv_store = state.get("kv_store", {})
+                    self.client_responses = state.get("client_responses", {})
+                    
+                    # Update volatile state to match snapshot
+                    self.commit_index = max(self.commit_index, self.last_included_index)
+                    self.last_applied = max(self.last_applied, self.last_included_index)
+            except Exception as e:
+                print(f"[{self.node_id}] Error loading state: {e}")
 
     # HELPER METHODS 
 
     def _get_last_log_index(self):
         """Return the index of the last log entry, or 0 if log is empty."""
-        return self.log[-1]["index"] if self.log else 0
+        if self.log:
+            return self.log[-1]["index"]
+        return self.last_included_index
 
     def _get_last_log_term(self):
         """Return the term of the last log entry, or 0 if log is empty."""
-        return self.log[-1]["term"] if self.log else 0
+        if self.log:
+            return self.log[-1]["term"]
+        return self.last_included_term
 
     def _get_log_term(self, index):
         """Return the term of the log entry at the given index, or 0."""
+        if index == 0:
+            return 0
+        if index == self.last_included_index:
+            return self.last_included_term
         for entry in self.log:
             if entry["index"] == index:
                 return entry["term"]
@@ -670,6 +848,8 @@ class RaftNode:
 
     def _get_log_entry(self, index):
         """Return the log entry at the given index, or None."""
+        if index <= self.last_included_index:
+            return None
         for entry in self.log:
             if entry["index"] == index:
                 return entry

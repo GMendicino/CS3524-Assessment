@@ -31,6 +31,8 @@ MSG_APPEND_ENTRIES = "APPEND_ENTRIES"
 MSG_APPEND_ENTRIES_RESPONSE = "APPEND_ENTRIES_RESPONSE"
 MSG_REQUEST_VOTE = "REQUEST_VOTE"
 MSG_REQUEST_VOTE_RESPONSE = "REQUEST_VOTE_RESPONSE"
+MSG_INSTALL_SNAPSHOT = "INSTALL_SNAPSHOT"
+MSG_INSTALL_SNAPSHOT_RESPONSE = "INSTALL_SNAPSHOT_RESPONSE"
 
 
 # === Wire Protocol ===
@@ -237,4 +239,48 @@ def make_append_entries(node_id, dst, term, prev_log_index, prev_log_term, entri
         "prev_log_term": prev_log_term,
         "entries": entries,
         "leader_commit": leader_commit,
+    }
+
+
+def make_install_snapshot(node_id, dst, term, last_included_index, last_included_term, data):
+    """
+    Create an INSTALL_SNAPSHOT message.
+
+    Args:
+        node_id: The leader's ID.
+        dst: The follower's ID.
+        term: The leader's current term.
+        last_included_index: The snapshot replaces all entries up through this index.
+        last_included_term: Term of last_included_index.
+        data: Raw bytes of the snapshot (state machine state, etc.).
+    """
+    return {
+        "type": MSG_INSTALL_SNAPSHOT,
+        "src": node_id,
+        "dst": dst,
+        "term": term,
+        "last_included_index": last_included_index,
+        "last_included_term": last_included_term,
+        "data": data,
+    }
+
+
+def make_install_snapshot_response(node_id, dst, term, last_included_index, success):
+    """
+    Create an INSTALL_SNAPSHOT_RESPONSE message.
+
+    Args:
+        node_id: The responding node's ID.
+        dst: The leader's ID.
+        term: Responding node's current term.
+        last_included_index: The index of the snapshot being acknowledged.
+        success: True if the snapshot was successfully installed.
+    """
+    return {
+        "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
+        "src": node_id,
+        "dst": dst,
+        "term": term,
+        "last_included_index": last_included_index,
+        "success": success,
     }
